@@ -1,10 +1,13 @@
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.repositories import chat_repository
 from app.schemas.chat import ChatConversationResponse, ChatMessageResponse, ChatRequest, ChatResponse
-from app.services.chat_service import send_chat_message
+from app.services.chat_service import send_chat_message, stream_chat_message_events
 
 router = APIRouter()
 
@@ -12,6 +15,15 @@ router = APIRouter()
 @router.post("", response_model=ChatResponse, status_code=status.HTTP_201_CREATED)
 def create_chat_message(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
     return send_chat_message(db, payload)
+
+
+@router.post("/stream")
+def stream_chat_message(payload: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
+    def event_stream():
+        for event in stream_chat_message_events(db, payload):
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.get("/conversations", response_model=list[ChatConversationResponse])

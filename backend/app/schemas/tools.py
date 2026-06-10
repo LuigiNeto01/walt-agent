@@ -6,7 +6,10 @@ class WakePcResponse(BaseModel):
     message: str
     target_mac: str | None = None
     broadcast_ip: str | None = None
+    source_ip: str | None = None
     port: int | None = None
+    ssh_ready: bool | None = None
+    ssh_check_seconds: int | None = None
 
 
 class SshCommandRequest(BaseModel):

@@ -2,6 +2,7 @@ import json
 import time
 import uuid
 from pathlib import Path
+from typing import Callable
 
 from openai import OpenAI
 
@@ -16,6 +17,18 @@ _REMOTE_LAUNCHER_BAT = "C:/Users/walt/run_launcher.bat"
 _REMOTE_LAUNCHER_LOG = "C:/Users/walt/walt_launcher_result.txt"
 # Python 3.12 system install (no spaces issue — well, has spaces but we wrap in bat)
 _REMOTE_PYTHON = r"C:\Program Files\Python312\python.exe"
+
+_ORCHESTRATION_PROMPT = """
+
+Modo operacional:
+- Para pedidos com varias etapas, transforme a intencao do usuario em um plano interno curto e execute as etapas usando quantas chamadas de tool forem necessarias.
+- Depois de cada resultado de tool, avalie se a etapa foi concluida, se precisa de uma verificacao adicional ou se deve tentar uma alternativa segura.
+- Nao responda ao usuario antes de terminar as etapas solicitadas ou antes de encontrar um bloqueio real.
+- Se o PC precisar estar ligado, chame wake_pc e use o resultado para decidir quando tentar SSH. Se SSH ainda nao estiver pronto, faca uma verificacao posterior com run_command antes de prosseguir.
+- Para tarefas de arquivos ou pastas, prefira comandos deterministas ou run_python_code quando houver condicoes, filtros ou multiplas listagens. Use caminhos completos em C:\\Users\\luigi.
+- Quando o usuario pedir uma acao final como desligar o PC, execute essa acao apenas depois de coletar as informacoes necessarias para a resposta final.
+- Ao finalizar, resuma o que foi feito, inclua os resultados relevantes e informe claramente qualquer etapa que falhou.
+""".strip()
 
 
 def _ensure_launcher() -> str | None:
@@ -229,8 +242,15 @@ def _execute_tool(name: str, args: dict) -> str:
     return f"Tool desconhecida: {name}"
 
 
+def _summarize_tool_result(result: str, limit: int = 520) -> str:
+    compact = " ".join(str(result).split())
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[: limit - 3].rstrip()}..."
+
+
 class OpenAIChatService:
-    _MAX_TOOL_ROUNDS = 10
+    _MAX_TOOL_ROUNDS = 16
 
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -248,7 +268,7 @@ class OpenAIChatService:
         resolved = system_prompt or self.settings.agent_system_prompt
         input_messages: list[dict] = []
         if resolved:
-            input_messages.append({"role": "system", "content": resolved})
+            input_messages.append({"role": "system", "content": f"{resolved}\n\n{_ORCHESTRATION_PROMPT}"})
         input_messages.extend(
             {"role": m.role, "content": m.content}
             for m in messages
@@ -260,7 +280,29 @@ class OpenAIChatService:
         self,
         messages: list[ChatMessage],
         system_prompt: str | None = None,
+        event_callback: Callable[[dict], None] | None = None,
     ) -> tuple[str, str | None, list[dict]]:
+        final_event = None
+        for event in self.iter_reply_events(messages, system_prompt):
+            if event["type"] == "reply_finished":
+                final_event = event
+            elif event_callback:
+                event_callback(event)
+
+        if final_event is None:
+            raise RuntimeError("Resposta final nao gerada pela OpenAI.")
+
+        return (
+            final_event["assistant_text"],
+            final_event["openai_response_id"],
+            final_event["tool_calls"],
+        )
+
+    def iter_reply_events(
+        self,
+        messages: list[ChatMessage],
+        system_prompt: str | None = None,
+    ):
         if not self.settings.openai_api_key:
             raise RuntimeError("OPENAI_API_KEY nao configurada.")
         if self.client is None:
@@ -268,6 +310,8 @@ class OpenAIChatService:
 
         input_messages = self._build_input(messages, system_prompt)
         all_tool_calls: list[dict] = []
+
+        yield {"type": "status", "message": "Analisando pedido e definindo proximas etapas."}
 
         response = self.client.responses.create(
             model=self.model,
@@ -282,18 +326,34 @@ class OpenAIChatService:
 
             tool_results = []
             for tc in tool_calls:
+                call_index = len(all_tool_calls) + 1
                 try:
                     args = json.loads(tc.arguments or "{}")
+                    yield {
+                        "type": "tool_started",
+                        "index": call_index,
+                        "name": tc.name,
+                        "args": args,
+                    }
                     result = _execute_tool(tc.name, args)
                 except Exception as exc:
                     args = {}
                     result = f"Falha ao executar tool {tc.name}: {exc}"
                 all_tool_calls.append({"name": tc.name, "args": args})
+                yield {
+                    "type": "tool_finished",
+                    "index": call_index,
+                    "name": tc.name,
+                    "args": args,
+                    "summary": _summarize_tool_result(result),
+                }
                 tool_results.append({
                     "type": "function_call_output",
                     "call_id": tc.call_id,
                     "output": result,
                 })
+
+            yield {"type": "status", "message": "Observando resultados e decidindo a proxima etapa."}
 
             response = self.client.responses.create(
                 model=self.model,
@@ -302,5 +362,17 @@ class OpenAIChatService:
                 tools=_TOOLS,
             )
 
-        assistant_text = response.output_text or "Concluido."
-        return assistant_text, response.id, all_tool_calls
+        remaining_tool_calls = [o for o in response.output if o.type == "function_call"]
+        if remaining_tool_calls:
+            assistant_text = (
+                "Nao consegui concluir a tarefa inteira porque atingi o limite de etapas automaticas. "
+                "As ferramentas executadas ate aqui ficaram registradas nesta conversa."
+            )
+        else:
+            assistant_text = response.output_text or "Concluido."
+        yield {
+            "type": "reply_finished",
+            "assistant_text": assistant_text,
+            "openai_response_id": response.id,
+            "tool_calls": all_tool_calls,
+        }

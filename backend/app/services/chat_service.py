@@ -1,11 +1,13 @@
 import json
 import re
+from collections.abc import Iterator
 
 from fastapi import HTTPException, status
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 
 from app.repositories import chat_repository
-from app.schemas.chat import ChatRequest, ChatResponse
+from app.schemas.chat import ChatConversationResponse, ChatMessageResponse, ChatRequest, ChatResponse
 from app.services.openai_chat_service import OpenAIChatService
 
 
@@ -124,3 +126,71 @@ def send_chat_message(db: Session, payload: ChatRequest) -> ChatResponse:
         user_message=user_message,
         assistant_message=assistant_message,
     )
+
+
+def stream_chat_message_events(db: Session, payload: ChatRequest) -> Iterator[dict]:
+    if payload.conversation_id:
+        conversation = chat_repository.get_conversation(db, payload.conversation_id)
+        if conversation is None:
+            yield {"type": "error", "message": "Conversa nao encontrada."}
+            return
+    else:
+        conversation = chat_repository.create_conversation(db, title=_build_title(payload.message))
+
+    user_message = chat_repository.add_message(
+        db=db,
+        conversation_id=conversation.id,
+        role="user",
+        content=payload.message,
+    )
+    db.commit()
+    db.refresh(conversation)
+    db.refresh(user_message)
+
+    yield {
+        "type": "user_message",
+        "conversation": jsonable_encoder(ChatConversationResponse.model_validate(conversation)),
+        "user_message": jsonable_encoder(ChatMessageResponse.model_validate(user_message)),
+    }
+
+    history = chat_repository.list_messages(db, conversation.id)
+    openai_service = OpenAIChatService()
+    final_reply: dict | None = None
+
+    try:
+        for event in openai_service.iter_reply_events(
+            messages=history,
+            system_prompt=payload.system_prompt,
+        ):
+            if event["type"] == "reply_finished":
+                final_reply = event
+            else:
+                yield event
+    except Exception as exc:
+        db.rollback()
+        yield {"type": "error", "message": f"Falha ao consultar a OpenAI: {exc}"}
+        return
+
+    if final_reply is None:
+        yield {"type": "error", "message": "Falha ao consultar a OpenAI: resposta final nao gerada."}
+        return
+
+    assistant_message = chat_repository.add_message(
+        db=db,
+        conversation_id=conversation.id,
+        role="assistant",
+        content=final_reply["assistant_text"],
+        model=openai_service.model,
+        openai_response_id=final_reply["openai_response_id"],
+        tool_calls_json=json.dumps(final_reply["tool_calls"], ensure_ascii=False) if final_reply["tool_calls"] else None,
+    )
+    db.commit()
+    db.refresh(conversation)
+    db.refresh(assistant_message)
+
+    response = ChatResponse(
+        conversation=conversation,
+        user_message=user_message,
+        assistant_message=assistant_message,
+    )
+    yield {"type": "final", "response": jsonable_encoder(response)}

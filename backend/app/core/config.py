@@ -26,7 +26,10 @@ class Settings(BaseSettings):
     wake_on_lan_enabled: bool = False
     wake_target_mac: str | None = None
     wake_broadcast_ip: str = "255.255.255.255"
+    wake_source_ip: str | None = None
     wake_port: int = 9
+    wake_verify_ssh_timeout: int = 90
+    wake_verify_ssh_interval: int = 5
     ssh_enabled: bool = False
     ssh_host: str | None = None
     ssh_port: int = 22
