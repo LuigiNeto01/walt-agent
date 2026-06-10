@@ -11,6 +11,10 @@ copy backend\.env.example backend\.env
 docker compose up --build
 ```
 
+Se voce usar `deploy.py`, os campos vazios do `backend/.env` local nao sobrescrevem secrets e configuracoes ja existentes no `.env` remoto. Quando a chave nao existe em nenhum dos dois lados, ela e omitida para evitar falha de bootstrap do FastAPI em variaveis booleanas e numericas opcionais.
+
+No deploy de producao, a API roda com o override `docker-compose.prod.yml` em rede de host. Isso e necessario para Wake-on-LAN sair pela LAN do servidor em vez da bridge do Docker.
+
 ## Rodando sem Docker
 
 ```powershell
@@ -43,6 +47,8 @@ Se `conversation_id` for omitido ou `null`, uma nova conversa sera criada. Para 
 
 Quando `system_prompt` nao e enviado, a API usa `AGENT_SYSTEM_PROMPT` do ambiente. Por padrao, o agent se chama Walt e atua como assistente para gestao do PC e tarefas.
 
+`POST /api/v1/chat/stream` aceita o mesmo payload e retorna `text/event-stream`. O frontend usa essa rota para mostrar status operacional, chamadas de tool e resumos de resultado enquanto o Walt executa a tarefa. O stream nao deve expor raciocinio interno literal do modelo.
+
 Consultas:
 
 - `GET /api/v1/chat/conversations`
@@ -52,6 +58,8 @@ Consultas:
 ## Function calling
 
 O chat usa function calling nativo da OpenAI. A API nao usa mais parsers por prefixo como `execute no pc:` ou `python no pc:`. O usuario pede naturalmente e o modelo decide quando chamar as tools.
+
+O prompt operacional do backend instrui o Walt a lidar com tarefas em varias etapas: planejar internamente, executar chamadas sucessivas, observar os resultados, verificar se cada etapa foi concluida e finalizar apenas quando a tarefa estiver completa ou houver um bloqueio real.
 
 Tools disponiveis em `app/services/openai_chat_service.py`:
 
@@ -72,9 +80,15 @@ As chamadas feitas pelo assistant sao salvas em `tool_calls_json`.
 ```env
 WAKE_ON_LAN_ENABLED=true
 WAKE_TARGET_MAC=AA:BB:CC:DD:EE:FF
-WAKE_BROADCAST_IP=255.255.255.255
+WAKE_BROADCAST_IP=192.168.0.255
 WAKE_PORT=9
+WAKE_VERIFY_SSH_TIMEOUT=90
+WAKE_VERIFY_SSH_INTERVAL=5
 ```
+
+`WAKE_SOURCE_IP` e opcional. Se informado, a API tenta fixar a interface de origem; se esse IP nao existir dentro do runtime atual, o envio continua sem bind explicito em vez de derrubar o endpoint.
+
+Quando SSH esta configurado, `wake_pc` tambem aguarda a porta SSH responder por ate `WAKE_VERIFY_SSH_TIMEOUT` segundos antes de retornar. Isso permite que fluxos de chat continuem para comandos SSH com menos tentativas prematuras.
 
 ### SSH
 

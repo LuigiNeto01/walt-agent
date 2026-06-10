@@ -27,6 +27,8 @@ Servicos:
 
 O frontend fica em `frontend/` e usa React + Vite. No Docker, o Nginx do frontend faz proxy de `/api` para o container da API, entao as chamadas usam `/api/v1`.
 
+No deploy do servidor, o frontend acessa a API via `host.docker.internal:8000` e o `docker-compose.prod.yml` coloca a API em rede de host para que o Wake-on-LAN saia pela LAN real da maquina.
+
 Rodando fora do Docker:
 
 ```powershell
@@ -40,6 +42,7 @@ npm run dev
 
 - `GET /api/v1/health`
 - `POST /api/v1/chat`
+- `POST /api/v1/chat/stream`
 - `GET /api/v1/chat/conversations`
 - `GET /api/v1/chat/conversations/{conversation_id}/messages`
 - `DELETE /api/v1/chat/conversations/{conversation_id}`
@@ -53,13 +56,16 @@ npm run dev
 
 As conversas e mensagens sao persistidas no PostgreSQL. Ao iniciar uma conversa, a API gera um titulo curto localmente a partir da primeira mensagem.
 
-O chat nao depende de comandos por prefixo. O usuario pode pedir naturalmente, por exemplo:
+O chat nao depende de comandos por prefixo. O usuario pode pedir naturalmente, inclusive tarefas com varias etapas, por exemplo:
 
 ```text
 Walt, ligue meu PC e depois veja o hostname.
+Walt, ligue o PC, entre em Documentos, liste tudo, se existir uma pasta GitHub liste ela tambem e no fim desligue o PC.
 ```
 
-A OpenAI decide se deve chamar alguma tool. As chamadas executadas ficam salvas em `tool_calls_json` na mensagem do assistant.
+A OpenAI decide se deve chamar alguma tool. O prompt operacional do backend instrui o Walt a planejar internamente, executar chamadas sucessivas, observar resultados, verificar etapas e so responder quando concluir ou encontrar um bloqueio real. As chamadas executadas ficam salvas em `tool_calls_json` na mensagem do assistant.
+
+O frontend usa `POST /api/v1/chat/stream` para exibir uma linha de execucao enquanto o Walt trabalha. Esse stream mostra status operacional, tools iniciadas, tools concluidas e resumos de saida; ele nao expoe raciocinio interno literal do modelo.
 
 ## Tools do Walt
 
@@ -80,9 +86,15 @@ Configure no `backend\.env`:
 ```env
 WAKE_ON_LAN_ENABLED=true
 WAKE_TARGET_MAC=AA:BB:CC:DD:EE:FF
-WAKE_BROADCAST_IP=255.255.255.255
+WAKE_BROADCAST_IP=192.168.0.255
 WAKE_PORT=9
+WAKE_VERIFY_SSH_TIMEOUT=90
+WAKE_VERIFY_SSH_INTERVAL=5
 ```
+
+Opcionalmente voce pode configurar `WAKE_SOURCE_IP` para tentar fixar a interface de origem do envio. Em deploys com Docker bridge, esse hint pode nao existir dentro do container; nesse caso o Walt faz fallback e continua enviando o broadcast sem falhar o endpoint.
+
+Quando SSH tambem estiver configurado, `wake_pc` aguarda a porta SSH responder por ate `WAKE_VERIFY_SSH_TIMEOUT` segundos antes de devolver o resultado. Isso ajuda o agent a nao tentar executar comandos enquanto o Windows ainda esta subindo.
 
 Teste direto:
 
@@ -127,6 +139,10 @@ Prerequisito: Luigi precisa estar logado na sessao interativa. Para funcionar ap
 ## Deploy
 
 O `deploy.py` envia o projeto para o servidor por SSH e sobe o Docker Compose remoto. Ele nao guarda secrets no codigo; le `backend/.env` local para gerar o `.env` de producao no servidor.
+
+Ao montar o `.env` de producao, o script envia apenas chaves com valor preenchido. Se uma chave estiver vazia no `backend/.env` local, o deploy preserva o valor remoto atual quando ele ja existir; se nao existir, a chave e omitida para o backend usar defaults quando apropriado.
+
+No servidor, o deploy usa `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build`. O override de producao coloca a API em `network_mode: host` para permitir Wake-on-LAN pela interface LAN da maquina hospedeira.
 
 ```powershell
 $env:DEPLOY_HOST="192.168.0.12"
