@@ -1,0 +1,6 @@
+services:
+  api:
+    network_mode: host
+    ports: !reset []
+    environment:
+      DATABASE_URL: postgresql+psycopg://walt:walt@127.0.0.1:5432/walt_agent

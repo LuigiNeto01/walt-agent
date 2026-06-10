@@ -31,12 +31,9 @@ EXCLUDE_DIRS = {".git", ".venv", "__pycache__", "node_modules", ".mypy_cache", "
 EXCLUDE_FILES = {".env"}
 
 
-def read_env_file(path: Path) -> dict[str, str]:
+def parse_env_text(content: str) -> dict[str, str]:
     values: dict[str, str] = {}
-    if not path.exists():
-        raise FileNotFoundError(f"Arquivo {path} nao encontrado. Crie a partir de backend/.env.example.")
-
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -45,8 +42,35 @@ def read_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def build_prod_env() -> str:
-    env = read_env_file(BACKEND_ENV)
+def read_env_file(path: Path) -> dict[str, str]:
+    if not path.exists():
+        raise FileNotFoundError(f"Arquivo {path} nao encontrado. Crie a partir de backend/.env.example.")
+
+    return parse_env_text(path.read_text(encoding="utf-8"))
+
+
+def read_remote_env_file(sftp: paramiko.SFTPClient, remote_path: str) -> dict[str, str]:
+    try:
+        with sftp.open(remote_path, "r") as remote_env:
+            return parse_env_text(remote_env.read().decode("utf-8"))
+    except FileNotFoundError:
+        return {}
+
+
+def build_prod_env(existing_remote_env: dict[str, str] | None = None) -> str:
+    local_env = read_env_file(BACKEND_ENV)
+    env = {
+        key: value
+        for key, value in (existing_remote_env or {}).items()
+        if value.strip()
+    }
+    env.update(
+        {
+            key: value
+            for key, value in local_env.items()
+            if value.strip()
+        }
+    )
     cors_origins = [
         origin.strip()
         for origin in env.get("CORS_ORIGINS", "").split(",")
@@ -87,6 +111,7 @@ def build_prod_env() -> str:
         "WAKE_ON_LAN_ENABLED",
         "WAKE_TARGET_MAC",
         "WAKE_BROADCAST_IP",
+        "WAKE_SOURCE_IP",
         "WAKE_PORT",
         "SSH_ENABLED",
         "SSH_HOST",
@@ -101,7 +126,11 @@ def build_prod_env() -> str:
         "SSH_DESKTOP_USERNAME",
         "SSH_DESKTOP_PASSWORD",
     ]
-    lines = [f"{key}={env.get(key, '')}" for key in ordered_keys]
+    lines = [
+        f"{key}={value}"
+        for key in ordered_keys
+        if (value := env.get(key, "").strip()) != ""
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -169,16 +198,20 @@ def main() -> None:
     print("=== Enviando arquivos ===")
     sftp = ssh.open_sftp()
     upload_dir(sftp, LOCAL_DIR, REMOTE_DIR)
+    remote_env_values = read_remote_env_file(sftp, f"{REMOTE_DIR}/backend/.env")
 
     print("  writing backend/.env (producao)")
     with sftp.open(f"{REMOTE_DIR}/backend/.env", "w") as remote_env:
-        remote_env.write(build_prod_env())
+        remote_env.write(build_prod_env(existing_remote_env=remote_env_values))
 
     sftp.close()
     print()
 
     print("=== Iniciando containers ===")
-    run(ssh, f"cd {REMOTE_DIR} && docker compose up -d --build 2>&1 | tail -30")
+    run(
+        ssh,
+        f"cd {REMOTE_DIR} && docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build 2>&1 | tail -30",
+    )
     print()
 
     print("=== Status final ===")
